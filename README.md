@@ -1,9 +1,10 @@
-# RFC5424-Syslog-Normalizer
+# F5-RFC5424-Syslog-Normalizer-iRule
 
 An F5 BIG-IP iRule that checks every syslog message on a TCP stream against RFC 5424 and either reports what is wrong or rewrites it into a valid message before it reaches the collector.
 
-Note that while every effort was taken to process TCP syslog as fast as possible, this solution is CPU intense and only recommended for small environments with limited messages per second requirements.
-Large enterprises should use a dedicated solution for syslog normalization, such as Cribl.
+**Note that while every effort was taken to process TCP syslog as fast as possible, this solution is CPU intense and only recommended for small environments with limited messages per second requirements.**
+
+Large enterprises should use a dedicated solution for syslog normalization, such as **Cribl.**
 
 ## What it checks and fixes
 
