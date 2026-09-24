@@ -1,0 +1,811 @@
+# RFC5424-Syslog-Normalizer_v1.0_irule
+# 
+# Version 1.0
+# September 2026
+# Eric Haupt
+#
+# Description:
+#   Normalizes non-compliant TCP syslog messages to RFC5424 via a 3 layer procedural call stack for export to a RFC5424 receiver.
+#
+# Log output (/var/log/ltm):
+#
+#    syslog_noncompliant         - Sampled defect: reasons in plain language, message timestamp, originating host
+#    syslog_framing_error        - Framing faults: loss of octet-count sync, oversized frames forwarded unparsed,
+#                                  unterminated data at connection close
+#
+
+when RULE_INIT {
+# ======================================================================================================
+# USER CONFIGURATION VARIABLES
+# ======================================================================================================
+
+    # Operating mode: 0 reports (logs non-compliant messages, forwards traffic unchanged), 1 repairs (logs and rewrites)
+    set static::syslog_normalizer_repair 0
+
+    # Logging on or off. 1 writes sampled defects and framing errors to local0; 0 writes nothing at all.
+    set static::syslog_normalizer_logging 0
+
+    # Sampling: log one sample per this many non-compliant messages, per reason combination per connection.
+    # 1 logs every non-compliant message
+    set static::syslog_normalizer_log_sample_every 10000
+
+    # Repair mode output framing: "octet" (RFC 6587 octet counting) or "lf" (line-feed terminated)
+    set static::syslog_normalizer_output_framing "octet"
+
+    # UTC offset for timestamps that carry none, including every RFC 3164 timestamp: "Z" or the senders' offset, such as "+02:00"
+    set static::syslog_normalizer_default_utc_offset "Z"
+
+    # 1 splits an RFC 3164 tag left in APP-NAME ("sshd[123]:") into APP-NAME and PROCID
+    set static::syslog_normalizer_split_rfc3164_tag 1
+
+    # Largest message parsed and most unterminated bytes buffered per connection; larger octet-counted frames are forwarded unparsed
+    set static::syslog_normalizer_max_message_bytes 65536
+
+# ======================================================================================================
+# END USER CONFIGURATION VARIABLES - Do not modify any variables below this line
+# ======================================================================================================
+    # Description per reason code
+    array set static::syslog_normalizer_reason_text {
+        no_pri    {no syslog <PRI> priority field}
+        pri_fmt   {priority field has a leading zero}
+        rfc3164   {legacy BSD RFC 3164 message}
+        v1_3164   {RFC 3164 header behind a version 1 field}
+        v1_tag    {RFC 3164 tag and text behind a version 1 header}
+        iso_3164  {RFC 3164 message with an ISO 8601 timestamp}
+        no_hdr    {valid priority but no usable header}
+        ts_space  {space instead of T inside the timestamp}
+        hdr_short {header has fewer than five fields}
+        ts_fix    {timestamp not in canonical RFC 5424 form}
+        ts_inv    {timestamp unparsable or impossible date}
+        hdr_swap  {timestamp and hostname fields swapped}
+        hdr_shift {header fields missing, structured data shifted left}
+        norm_tag  {RFC 3164 tag left in the APP-NAME field}
+        host_inv  {hostname not printable ASCII or too long}
+        app_inv   {app name not printable ASCII or too long}
+        pid_inv   {process id not printable ASCII or too long}
+        msgid_inv {message id not printable ASCII or too long}
+        sd_inv    {structured data malformed}
+        sd_none   {no structured data field}
+        oversize  {frame larger than the maximum, forwarded unparsed}
+    }
+    # Month abbreviations; list index plus one is the month number
+    set static::syslog_normalizer_month_names {Jan Feb Mar Apr May Jun Jul Aug Sep Oct Nov Dec}
+    set static::syslog_normalizer_line_break_map [list "\n" " " "\r" " "]
+    # Fast path: matches only messages that are certainly compliant, from the PRI through the end of STRUCTURED-DATA.
+    # TIMESTAMP is matched as any token here and validated by position in fast_compliance_check, which costs less than
+    # encoding the calendar in the pattern. An SD-ID must be NAME@ENTERPRISE (section 7.2); the IANA names (timeQuality,
+    # origin, meta) take the full parse, since a literal alternation there costs 2.5x. SD-ID length is checked by the
+    # long-name pattern
+    set static::syslog_normalizer_compliant_pattern {^<(?:[0-9]|[1-9][0-9]|1[0-8][0-9]|19[01])>1 [!-~]+ [!-~]+ [!-9;-Z\\-~]+ [!-Z\\-~][!-~]* [!-Z\\-~][!-~]* (?:-|(?:\[[!#-<>-?A-\\^-~]+@[0-9]+(?:\.[0-9]+)*(?: [!#-<>-\\^-~]+="(?:\\.|[^]"\\])*")*\])+)(?: |$)}
+    # Fraction and UTC offset that may follow the fixed 19 characters of a fast-path TIMESTAMP
+    set static::syslog_normalizer_timestamp_tail_pattern {^(?:\.[0-9]{1,6})?(?:Z|[+-](?:[01][0-9]|2[0-3]):[0-5][0-9])$}
+    # An SD-ID or PARAM-NAME longer than 32 characters
+    set static::syslog_normalizer_long_sd_name_pattern {[\[ ][!#-<>-\\^-~]{33}}
+}
+when CLIENT_ACCEPTED {
+    set syslog_pending_bytes ""
+    # Input framing: empty until detected, then "octet" or "lf"
+    set syslog_input_framing ""
+    # Set by the first frame whose body opens with "<". A bad count before that means misdetected framing; after it, lost sync
+    set syslog_octet_framing_confirmed 0
+    # Bytes of an oversized frame still to pass through
+    set syslog_oversize_remaining_bytes 0
+    # Set while scanning for the next frame boundary, so one loss of sync logs once
+    set syslog_resync_active 0
+    array set syslog_occurrence_counts {}
+    # Client address without the route domain suffix; logged as source= and used as HOSTNAME when a message has none
+    set syslog_source_address [lindex [split [IP::client_addr] %] 0]
+    # Hold client payload, and the server-side connection, until TCP::release
+    TCP::collect
+}
+when CLIENT_DATA {
+    # Nothing between this read and TCP::release suspends the event, so the payload length stays valid
+    set syslog_payload_length [TCP::payload length]
+    append syslog_pending_bytes [TCP::payload $syslog_payload_length]
+    # Kind/data pairs in arrival order: "message" is one unframed message, "oversize" marks an oversized frame
+    # for counting, "raw" is output-ready bytes of that frame
+    set syslog_batch_items {}
+# ======================================================================================================
+# FRAMING DETECTION AND MESSAGE EXTRACTION
+# ======================================================================================================
+    if {$syslog_input_framing eq ""} {
+        set syslog_first_byte [string index [string trimleft $syslog_pending_bytes "\r\n"] 0]
+        if {$syslog_first_byte eq ""} {
+            set syslog_pending_bytes ""
+        } elseif {[string is digit $syslog_first_byte]} {
+            set syslog_input_framing octet
+        } else {
+            set syslog_input_framing lf
+        }
+    }
+    # Octet-counted frame: "<length> <message>", length in bytes without leading zeros. One read index and one buffer trim keep a large batch linear
+    if {$syslog_input_framing eq "octet"} {
+        set syslog_read_index 0
+        set syslog_pending_length [string length $syslog_pending_bytes]
+        while {$syslog_read_index < $syslog_pending_length} {
+            # An oversized frame passes through as it arrives. LF output cannot carry line breaks, so they are flattened and the frame ends with a line feed
+            if {$syslog_oversize_remaining_bytes > 0} {
+                set syslog_oversize_chunk [string range $syslog_pending_bytes $syslog_read_index [expr {$syslog_read_index + $syslog_oversize_remaining_bytes - 1}]]
+                incr syslog_read_index [string length $syslog_oversize_chunk]
+                incr syslog_oversize_remaining_bytes -[string length $syslog_oversize_chunk]
+                if {$static::syslog_normalizer_output_framing ne "octet"} {
+                    set syslog_oversize_chunk [string map $static::syslog_normalizer_line_break_map $syslog_oversize_chunk]
+                    if {$syslog_oversize_remaining_bytes == 0} { append syslog_oversize_chunk "\n" }
+                }
+                lappend syslog_batch_items raw $syslog_oversize_chunk
+                continue
+            }
+            # Skip line breaks that some senders add after each frame
+            set syslog_current_byte [string index $syslog_pending_bytes $syslog_read_index]
+            if {$syslog_current_byte eq "\n" || $syslog_current_byte eq "\r"} {
+                incr syslog_read_index
+                continue
+            }
+            set syslog_length_delimiter_index [string first " " $syslog_pending_bytes $syslog_read_index]
+            if {$syslog_length_delimiter_index < 0} {
+                # Possibly an incomplete length field; wait for the space
+                set syslog_length_field [string range $syslog_pending_bytes $syslog_read_index end]
+                if {[string length $syslog_length_field] <= 7 && [string is digit $syslog_length_field]} { break }
+            } else {
+                set syslog_length_field [string range $syslog_pending_bytes $syslog_read_index [expr {$syslog_length_delimiter_index - 1}]]
+            }
+            if {$syslog_length_delimiter_index < 0
+                || $syslog_length_delimiter_index - $syslog_read_index > 7
+                || ![string is digit -strict $syslog_length_field]
+                || [string index $syslog_length_field 0] eq "0"} {
+                if {!$syslog_resync_active} {
+                    # Mask quotes and non-printable bytes so sender data cannot forge log fields
+                    regsub -all {[^ !#-~]} [string range $syslog_pending_bytes $syslog_read_index [expr {$syslog_read_index + 40}]] . syslog_stream_excerpt
+                }
+                # Before octet counting is confirmed, a bad length field means an LF sender whose first message began with a digit
+                if {!$syslog_octet_framing_confirmed} {
+                    if {$static::syslog_normalizer_logging} {
+                        log local0.warn "syslog_framing_error source=$syslog_source_address no octet count at \"$syslog_stream_excerpt\", parsing connection as LF"
+                    }
+                    set syslog_input_framing lf
+                    break
+                }
+                if {!$syslog_resync_active} {
+                    if {$static::syslog_normalizer_logging} {
+                        log local0.warn "syslog_framing_error source=$syslog_source_address octet-count desync at \"$syslog_stream_excerpt\", scanning for next frame"
+                    }
+                    set syslog_resync_active 1
+                }
+                # Lost sync: resume at the next "<length> <PRI>" not preceded by a digit and forward the skipped bytes as one message
+                if {[regexp -indices -start $syslog_read_index {[^0-9]([1-9][0-9]{0,6} <[0-9]{1,3}>)} $syslog_pending_bytes -> syslog_boundary_indices]} {
+                    set syslog_boundary_index [lindex $syslog_boundary_indices 0]
+                    set syslog_skipped_bytes [string range $syslog_pending_bytes $syslog_read_index [expr {$syslog_boundary_index - 1}]]
+                    if {[string trim $syslog_skipped_bytes "\r\n\0"] ne ""} { lappend syslog_batch_items message $syslog_skipped_bytes }
+                    set syslog_read_index $syslog_boundary_index
+                    set syslog_resync_active 0
+                    continue
+                }
+                # No boundary yet: wait for more data, up to the maximum message size
+                if {$syslog_pending_length - $syslog_read_index > $static::syslog_normalizer_max_message_bytes} {
+                    lappend syslog_batch_items message [string range $syslog_pending_bytes $syslog_read_index [expr {$syslog_read_index + $static::syslog_normalizer_max_message_bytes - 1}]]
+                    incr syslog_read_index $static::syslog_normalizer_max_message_bytes
+                    continue
+                }
+                break
+            }
+            # Validated; numeric from here on
+            set syslog_frame_length $syslog_length_field
+            # A valid count does not confirm octet counting, since an LF message may open with one ("404 not found").
+            # Until a body opens with "<", a line feed inside the claimed frame means LF framing
+            if {!$syslog_octet_framing_confirmed} {
+                if {$syslog_length_delimiter_index + 1 >= $syslog_pending_length} { break }
+                set syslog_line_feed_index [string first "\n" $syslog_pending_bytes $syslog_length_delimiter_index]
+                set syslog_line_feed_inside [expr {$syslog_line_feed_index >= 0 && $syslog_line_feed_index <= $syslog_length_delimiter_index + $syslog_frame_length}]
+                set syslog_framing_fallback ""
+                if {[string index $syslog_pending_bytes [expr {$syslog_length_delimiter_index + 1}]] eq "<"} {
+                    # A body opening with "<" is octet counting unless a line feed inside the claimed frame is followed by
+                    # another PRI, which is an LF sender whose line began with "123 <" ("123 <14>1 ..."). A line feed with
+                    # nothing after it yet decides nothing, so wait
+                    if {$syslog_line_feed_inside} {
+                        if {$syslog_line_feed_index + 1 >= $syslog_pending_length} { break }
+                        if {[regexp {^<[0-9]{1,3}>} [string range $syslog_pending_bytes [expr {$syslog_line_feed_index + 1}] [expr {$syslog_line_feed_index + 5}]]]} {
+                            set syslog_framing_fallback "line feed and PRI inside unconfirmed octet frame"
+                        }
+                    }
+                    if {$syslog_framing_fallback eq ""} { set syslog_octet_framing_confirmed 1 }
+                } elseif {$syslog_line_feed_index >= 0} {
+                    # An octet-counted syslog stream opens with "<"; a count-led body without one plus a line feed anywhere is LF
+                    set syslog_framing_fallback "count-led line without PRI"
+                } elseif {$syslog_pending_length - $syslog_read_index > $static::syslog_normalizer_max_message_bytes} {
+                    set syslog_framing_fallback "no PRI or line feed within $static::syslog_normalizer_max_message_bytes bytes"
+                } else {
+                    # Neither a PRI nor a line feed yet: wait rather than extract from a stream whose framing is unknown
+                    break
+                }
+                if {$syslog_framing_fallback ne ""} {
+                    regsub -all {[^ !#-~]} [string range $syslog_pending_bytes $syslog_read_index [expr {$syslog_read_index + 40}]] . syslog_stream_excerpt
+                    if {$static::syslog_normalizer_logging} {
+                        log local0.warn "syslog_framing_error source=$syslog_source_address $syslog_framing_fallback at \"$syslog_stream_excerpt\", parsing connection as LF"
+                    }
+                    set syslog_input_framing lf
+                    break
+                }
+            }
+            # Oversized frame: keep its count and pass the body through unparsed
+            if {$syslog_frame_length > $static::syslog_normalizer_max_message_bytes} {
+                if {$static::syslog_normalizer_logging} {
+                    log local0.warn "syslog_framing_error source=$syslog_source_address $syslog_frame_length byte frame exceeds $static::syslog_normalizer_max_message_bytes, forwarded unparsed"
+                }
+                lappend syslog_batch_items oversize {}
+                if {$static::syslog_normalizer_output_framing eq "octet"} { lappend syslog_batch_items raw "$syslog_frame_length " }
+                set syslog_oversize_remaining_bytes $syslog_frame_length
+                set syslog_read_index [expr {$syslog_length_delimiter_index + 1}]
+                continue
+            }
+            # Wait for the rest of the frame
+            set syslog_frame_last_index [expr {$syslog_length_delimiter_index + $syslog_frame_length}]
+            if {$syslog_frame_last_index >= $syslog_pending_length} { break }
+            lappend syslog_batch_items message [string range $syslog_pending_bytes [expr {$syslog_length_delimiter_index + 1}] $syslog_frame_last_index]
+            set syslog_read_index [expr {$syslog_frame_last_index + 1}]
+        }
+        set syslog_pending_bytes [string range $syslog_pending_bytes $syslog_read_index end]
+    }
+    # Also reached when octet detection proved wrong. The last split element is the unterminated remainder
+    if {$syslog_input_framing eq "lf"} {
+        set syslog_lines [split $syslog_pending_bytes "\n"]
+        set syslog_pending_bytes [lindex $syslog_lines end]
+        foreach syslog_line [lrange $syslog_lines 0 end-1] {
+            if {[string trim $syslog_line "\r\0"] ne ""} { lappend syslog_batch_items message $syslog_line }
+        }
+        # Bound memory when a sender never sends a line feed
+        if {[string length $syslog_pending_bytes] > $static::syslog_normalizer_max_message_bytes} {
+            if {$static::syslog_normalizer_logging} {
+                log local0.warn "syslog_framing_error source=$syslog_source_address $static::syslog_normalizer_max_message_bytes bytes without LF, flushing"
+            }
+            while {[string length $syslog_pending_bytes] > $static::syslog_normalizer_max_message_bytes} {
+                lappend syslog_batch_items message [string range $syslog_pending_bytes 0 [expr {$static::syslog_normalizer_max_message_bytes - 1}]]
+                set syslog_pending_bytes [string range $syslog_pending_bytes $static::syslog_normalizer_max_message_bytes end]
+            }
+        }
+    }
+# ======================================================================================================
+# MESSAGE PROCESSING AND OUTPUT
+# ======================================================================================================
+    # One clock read per batch
+    set syslog_clock_seconds [clock seconds]
+    scan [clock format $syslog_clock_seconds -format "%Y %m" -gmt 1] "%d %d" syslog_current_year syslog_current_month
+    set syslog_batch_context [list $syslog_source_address $syslog_current_year $syslog_current_month [clock format $syslog_clock_seconds -format "%Y-%m-%dT%H:%M:%SZ" -gmt 1]]
+    set syslog_output_bytes ""
+    # Classify each item, log samples, and build the output stream
+    foreach {syslog_item_kind syslog_item_data} $syslog_batch_items {
+        if {$syslog_item_kind eq "raw"} {
+            if {$static::syslog_normalizer_repair} { append syslog_output_bytes $syslog_item_data }
+            continue
+        }
+        if {$syslog_item_kind eq "oversize"} {
+            set syslog_reasons oversize
+        } elseif {[call fast_compliance_check $syslog_item_data]} {
+            # Certainly compliant: no reasons, and the original bytes are forwarded
+            set syslog_reasons {}
+        } else {
+            set syslog_normalize_result [call normalize_message $syslog_item_data $syslog_batch_context]
+            set syslog_repaired_message [lindex $syslog_normalize_result 0]
+            set syslog_reasons [lindex $syslog_normalize_result 1]
+        }
+        if {[llength $syslog_reasons]} {
+            # Occurrences per reason key (comma-joined reason codes); the first and every Nth are sampled
+            set syslog_reason_key [join $syslog_reasons ,]
+            if {[info exists syslog_occurrence_counts($syslog_reason_key)]} {
+                incr syslog_occurrence_counts($syslog_reason_key)
+            } else {
+                set syslog_occurrence_counts($syslog_reason_key) 1
+            }
+            # Oversized frames are already logged as syslog_framing_error
+            if {$syslog_item_kind eq "message" && ($static::syslog_normalizer_log_sample_every == 1 || $syslog_occurrence_counts($syslog_reason_key) % $static::syslog_normalizer_log_sample_every == 1)} {
+                # The repaired form always carries a timestamp and hostname: the sender's where usable, otherwise the receive time and source address
+                set syslog_sample_timestamp -
+                set syslog_sample_hostname -
+                regexp {^<\d{1,3}>1 (\S+) (\S+)} $syslog_repaired_message -> syslog_sample_timestamp syslog_sample_hostname
+                set syslog_reason_descriptions {}
+                foreach syslog_reason_code $syslog_reasons { lappend syslog_reason_descriptions $static::syslog_normalizer_reason_text($syslog_reason_code) }
+                if {$static::syslog_normalizer_logging} {
+                    log local0.notice "syslog_noncompliant source=$syslog_source_address host=$syslog_sample_hostname ts=$syslog_sample_timestamp reason=\"[join $syslog_reason_descriptions {; }]\""
+                }
+            }
+        }
+        # Report mode forwards the original bytes; an oversized frame's bytes follow as "raw" items
+        if {!$static::syslog_normalizer_repair || $syslog_item_kind eq "oversize"} {
+            continue
+        }
+        # Compliant messages keep their original bytes
+        if {[llength $syslog_reasons] == 0} {
+            set syslog_output_message $syslog_item_data
+        } else {
+            set syslog_output_message $syslog_repaired_message
+        }
+        if {$static::syslog_normalizer_output_framing eq "octet"} {
+            # Under LF input a trailing CR is part of the CRLF terminator, which octet framing does not carry
+            if {$syslog_input_framing eq "lf"} { set syslog_output_message [string trimright $syslog_output_message "\r"] }
+            # string length counts bytes because TCP::payload returns byte strings
+            append syslog_output_bytes "[string length $syslog_output_message] $syslog_output_message"
+        } elseif {[llength $syslog_reasons] == 0} {
+            # Verbatim apart from embedded line feeds, which LF framing cannot carry
+            append syslog_output_bytes "[string map [list "\n" " "] $syslog_output_message]\n"
+        } else {
+            append syslog_output_bytes "[string map $static::syslog_normalizer_line_break_map $syslog_repaired_message]\n"
+        }
+    }
+    if {$static::syslog_normalizer_repair} {
+        TCP::payload replace 0 $syslog_payload_length $syslog_output_bytes
+    }
+    TCP::release
+    TCP::collect
+}
+when CLIENT_CLOSED {
+    # Report mode already forwarded these bytes; repair mode was holding them for the end of the message
+    if {[string trim $syslog_pending_bytes "\r\n\0"] ne ""} {
+        if {$static::syslog_normalizer_repair} {
+            if {$static::syslog_normalizer_logging} {
+                log local0.warn "syslog_framing_error source=$syslog_source_address dropped [string length $syslog_pending_bytes] unterminated bytes at close"
+            }
+        } else {
+            if {$static::syslog_normalizer_logging} {
+                log local0.warn "syslog_framing_error source=$syslog_source_address [string length $syslog_pending_bytes] unterminated bytes at close, forwarded unparsed"
+            }
+        }
+    }
+    if {$syslog_oversize_remaining_bytes > 0} {
+        if {$static::syslog_normalizer_logging} {
+            log local0.warn "syslog_framing_error source=$syslog_source_address connection closed $syslog_oversize_remaining_bytes bytes short of an oversized frame"
+        }
+    }
+}
+# ======================================================================================================
+# Procedure for recognizing a compliant message without parsing it
+# ======================================================================================================
+# @param raw_message - One message, without its framing
+# @returns 1 when the message is certainly compliant, meaning normalize_message would raise no reason code;
+#          0 when normalize_message must decide, which includes the compliant messages the pattern leaves out
+proc fast_compliance_check {raw_message} {
+    if {![regexp -- $static::syslog_normalizer_compliant_pattern $raw_message]} { return 0 }
+    # The pattern guarantees the six spaces that end VERSION through MSGID
+    set timestamp_start_index [expr {[string first " " $raw_message] + 1}]
+    set field_start_index [expr {[string first " " $raw_message $timestamp_start_index] + 1}]
+    set timestamp [string range $raw_message $timestamp_start_index [expr {$field_start_index - 2}]]
+    # TIMESTAMP is "-" or YYYY-MM-DDTHH:MM:SS in ASCII digits, a real calendar date except February 29 (left to the full
+    # parse), no leap second, then an optional fraction of up to six digits and "Z" or a +hh:mm offset
+    if {$timestamp ne "-"} {
+        if {![string match {[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-9][0-9]:[0-9][0-9]:[0-9][0-9]?*} $timestamp]} { return 0 }
+        scan [string range $timestamp 5 18] "%d-%d%*c%d:%d:%d" month day hour minute second
+        if {$month < 1 || $month > 12 || $day < 1 || $day > 31 || $hour > 23 || $minute > 59 || $second > 59} { return 0 }
+        if {$day > 28 && ($month == 2 || ($day == 31 && [lsearch -exact {4 6 9 11} $month] >= 0))} { return 0 }
+        if {![regexp -- $static::syslog_normalizer_timestamp_tail_pattern [string range $timestamp 19 end]]} { return 0 }
+    }
+    # Length limits of RFC 5424 sections 6.2.4 to 6.2.7, from HOSTNAME on
+    foreach max_length {255 48 128 32} {
+        set field_delimiter_index [string first " " $raw_message $field_start_index]
+        if {$field_delimiter_index - $field_start_index > $max_length} { return 0 }
+        set field_start_index [expr {$field_delimiter_index + 1}]
+    }
+    # The scan runs from STRUCTURED-DATA through the body, so a long token in the body sends a compliant message to normalize_message; never the reverse
+    if {[string index $raw_message $field_start_index] eq "\[" && [regexp -start $field_start_index -- $static::syslog_normalizer_long_sd_name_pattern $raw_message]} { return 0 }
+    return 1
+}
+# ======================================================================================================
+# Procedure for checking and repairing one message
+# ======================================================================================================
+# @param raw_message - One message, without its framing
+# @param batch_context - {source_address current_year current_month receive_timestamp}, built once per batch
+# @returns Two-element list: the RFC 5424 message, and the reason codes raised; an empty list means
+#          the message arrived compliant
+#
+# RFC 5424 section 6:
+#   <PRI>VERSION SP TIMESTAMP SP HOSTNAME SP APP-NAME SP PROCID SP MSGID SP STRUCTURED-DATA [SP MSG]
+#
+# Flow: PRI, then one of two layouts. RFC 3164 bodies (BSD timestamp, ISO timestamp in 3164 position, or a 3164 tag
+# behind a version 1 header) are split once by split_rfc3164_host_tag; RFC 5424 headers are split by position and
+# repaired field by field. Both converge on one sanitize pass over the header fields and one build_rfc5424_message call,
+# so every lossy edit raises its reason code and every rebuilt message leaves through the same point
+proc normalize_message {raw_message batch_context} {
+    set reasons {}
+    set raw_message [string trimright $raw_message "\r\n\0"]
+    set source_address [lindex $batch_context 0]
+    set receive_timestamp [lindex $batch_context 3]
+    # RFC 3164 section 4.3.3: no valid PRI, so use <13> and keep the original text as the body
+    if {![regexp {^<(\d{1,3})>(.*)$} $raw_message -> priority_text after_priority] || [scan $priority_text %d priority] != 1 || $priority > 191} {
+        lappend reasons no_pri
+        return [list [call build_rfc5424_message 13 $receive_timestamp $source_address - - - - $raw_message] $reasons]
+    }
+    # A leading zero, as in "<014>" or "<00>", is invalid
+    if {[string length $priority_text] > 1 && [string index $priority_text 0] eq "0"} { lappend reasons pri_fmt }
+    # Three layouts carry an RFC 3164 host, tag and text behind a timestamp. Each sets {timestamp after_timestamp} here and
+    # the split below handles all of them; an empty timestamp means the layout matched but the date is impossible
+    set legacy_fields ""
+    if {[string range $after_priority 0 1] ne "1 "} {
+        # Without VERSION "1 " the message is RFC 3164 or has no usable header
+        set legacy_fields [call normalize_bsd_timestamp $after_priority $batch_context]
+        if {$legacy_fields ne ""} {
+            lappend reasons rfc3164
+        } elseif {[regexp {^(\d\S*)(?: (.*))?$} $after_priority -> iso_timestamp after_timestamp]
+            && [set normalized_timestamp [call normalize_iso_timestamp $iso_timestamp]] ne ""} {
+            # RSYSLOG_ForwardFormat and similar: RFC 3164 layout with an RFC 3339 timestamp
+            lappend reasons iso_3164
+            set legacy_fields [list $normalized_timestamp $after_timestamp]
+        } else {
+            # RFC 3164 section 4.3.2: a valid PRI without a usable timestamp takes the receive time and source address
+            lappend reasons no_hdr
+            return [list [call build_rfc5424_message $priority $receive_timestamp $source_address - - - - $after_priority] $reasons]
+        }
+    } else {
+        set after_version [string range $after_priority 2 end]
+        # Log Insight defect: "1 " prepended to an RFC 3164 header, as in "<14>1 Aug  9 12:41:44 host ..."
+        set legacy_fields [call normalize_bsd_timestamp $after_version $batch_context]
+        if {$legacy_fields ne ""} { lappend reasons v1_3164 }
+    }
+    if {$legacy_fields ne ""} {
+        foreach {timestamp after_timestamp} $legacy_fields { break }
+        # Impossible date: use the receive time and keep the sender's host and tag
+        if {$timestamp eq ""} {
+            lappend reasons ts_inv
+            set timestamp $receive_timestamp
+        }
+        foreach {hostname app_name proc_id message} [call split_rfc3164_host_tag $after_timestamp $source_address] { break }
+        set msg_id -
+        set structured_data -
+    } else {
+        # A space in place of "T" ("2026-09-17 10:00:00") would shift every following field. Checked by position: the date
+        # and time digits, then the first whitespace after the seconds must be a space
+        if {[string index $after_version 10] eq " " && [string index $after_version 4] eq "-" && [string index $after_version 7] eq "-"
+            && [string index $after_version 13] eq ":" && [string index $after_version 16] eq ":"
+            && [string is digit -strict "[string range $after_version 0 3][string range $after_version 5 6][string range $after_version 8 9][string range $after_version 11 12][string range $after_version 14 15][string range $after_version 17 18]"]
+            && [regexp -indices -start 19 {\s} $after_version whitespace_indices]
+            && [string index $after_version [lindex $whitespace_indices 0]] eq " "} {
+            lappend reasons ts_space
+            set after_version "[string range $after_version 0 9]T[string range $after_version 11 end]"
+        }
+        # Split the five header fields on single spaces; "string first" costs a tenth of the equivalent regexp.
+        # An empty field or whitespace inside a field means the header cannot be trusted
+        set header_fields {}
+        set field_start_index 0
+        while {[llength $header_fields] < 5} {
+            set field_delimiter_index [string first " " $after_version $field_start_index]
+            if {$field_delimiter_index < 0} { set field_delimiter_index [string length $after_version] }
+            if {$field_delimiter_index <= $field_start_index} { break }
+            lappend header_fields [string range $after_version $field_start_index [expr {$field_delimiter_index - 1}]]
+            set field_start_index [expr {$field_delimiter_index + 1}]
+        }
+        if {[llength $header_fields] < 5 || [regexp {\s} [join $header_fields ""]]} {
+            lappend reasons hdr_short
+            return [list [call build_rfc5424_message $priority $receive_timestamp $source_address - - - - $after_version] $reasons]
+        }
+        foreach {timestamp hostname app_name proc_id msg_id} $header_fields { break }
+        set after_msg_id [string range $after_version $field_start_index end]
+        # Empty means unusable
+        set normalized_timestamp [call normalize_iso_timestamp $timestamp]
+        if {$normalized_timestamp eq ""} {
+            # A full timestamp is never a plausible hostname: when the hostname field normalizes as one and the
+            # timestamp field does not, the sender swapped the two, so exchange them instead of discarding both
+            set swapped_timestamp [call normalize_iso_timestamp $hostname]
+            if {$swapped_timestamp ne "" && $swapped_timestamp ne "-"} {
+                set hostname $timestamp
+                set timestamp $swapped_timestamp
+                lappend reasons hdr_swap
+            } else {
+                lappend reasons ts_inv
+                set timestamp $receive_timestamp
+            }
+        } elseif {$normalized_timestamp ne $timestamp} {
+            lappend reasons ts_fix
+            set timestamp $normalized_timestamp
+        }
+        # Log Insight defect, ISO form: "1 " before an RFC 3164 host, tag and text ("<14>1 2026-09-18T10:00:00Z host sshd[4121]: Accepted
+        # publickey ..."), which puts the first two words of the text in PROCID and MSGID. A tag followed by a NIL or numeric PROCID,
+        # a NIL MSGID and valid structured data is the other Log Insight form, a full header with the tag copied into APP-NAME,
+        # and is left to the tag split below
+        if {$static::syslog_normalizer_split_rfc3164_tag && [regexp {^[A-Za-z_%][^\s:\[]{0,47}(?:\[[^\]\s]+\])?:$} $app_name]
+            && !(($proc_id eq "-" || [string is digit -strict $proc_id]) && $msg_id eq "-" && [lindex [call split_structured_data $after_msg_id] 2])} {
+            lappend reasons v1_tag
+            set tag_text "$app_name $proc_id $msg_id"
+            if {$after_msg_id ne ""} { append tag_text " $after_msg_id" }
+            # The hostname field is already known; the split sees only the tag and text
+            foreach {- app_name proc_id message} [call split_rfc3164_host_tag $tag_text $hostname] { break }
+            set msg_id -
+            set structured_data -
+        } else {
+            # A header field opening with "[" usually means an omitted field shifted the structured data left. A field closed
+            # by "]" (APP-NAME "[kernel]") is left alone when valid structured data already sits in position
+            foreach field_variable {app_name proc_id msg_id} {
+                set field_value [set $field_variable]
+                if {[string index $field_value 0] ne "\["} { continue }
+                if {[string index $field_value end] eq "\]" && [lindex [call split_structured_data $after_msg_id] 2]} { break }
+                switch -- $field_variable {
+                    app_name { set shifted_text "$app_name $proc_id $msg_id"; set app_name -; set proc_id - }
+                    proc_id  { set shifted_text "$proc_id $msg_id"; set proc_id - }
+                    msg_id   { set shifted_text $msg_id }
+                }
+                set msg_id -
+                if {$after_msg_id ne ""} { append shifted_text " $after_msg_id" }
+                set after_msg_id $shifted_text
+                lappend reasons hdr_shift
+                break
+            }
+            # Log Insight copies the RFC 3164 tag into APP-NAME verbatim ("app:", "sshd[4121]:"), which becomes the ProcessName in Sentinel
+            if {$static::syslog_normalizer_split_rfc3164_tag && [regexp {^([^\[:]+)(?:\[([^\]]+)\])?:?$} $app_name -> tag_name tag_proc_id] && $tag_name ne $app_name} {
+                set app_name $tag_name
+                if {$proc_id eq "-" && $tag_proc_id ne ""} { set proc_id $tag_proc_id }
+                lappend reasons norm_tag
+            }
+            # STRUCTURED-DATA is validated after the header fields, below
+            set structured_data ""
+        }
+    }
+    # RFC 5424 sections 6.2.4 to 6.2.7, on every path: field variable, maximum length, reason code. The only point in the
+    # rule where received bytes are altered or lost, and each occurrence raises its reason code
+    foreach {field_variable max_length reason_code} {hostname 255 host_inv app_name 48 app_inv proc_id 128 pid_inv msg_id 32 msgid_inv} {
+        set original_value [set $field_variable]
+        set sanitized_value [call sanitize_header_field $original_value $max_length]
+        if {$sanitized_value ne $original_value} {
+            lappend reasons $reason_code
+            set $field_variable $sanitized_value
+        }
+    }
+    if {$structured_data eq ""} {
+        set structured_data_result [call split_structured_data $after_msg_id]
+        if {![lindex $structured_data_result 2]} { lappend reasons [expr {$after_msg_id eq "" ? "sd_none" : "sd_inv"}] }
+        foreach {structured_data message} $structured_data_result { break }
+    }
+    return [list [call build_rfc5424_message $priority $timestamp $hostname $app_name $proc_id $msg_id $structured_data $message] $reasons]
+}
+# ======================================================================================================
+# Procedure for validating and normalizing an RFC 3164 (BSD syslog) TIMESTAMP
+# ======================================================================================================
+# @param text - Message text after the PRI, and after a bogus VERSION if one was present
+# @param batch_context - Same list as normalize_message
+# @returns {timestamp after_timestamp}: the timestamp in RFC 5424 form and the text that follows it, or "" if the
+#          text does not have the RFC 3164 timestamp layout. The timestamp element is "" when the layout matched but
+#          the date or time is impossible ("Feb 30", hour 24), so that the caller substitutes its own time. The
+#          caller passes after_timestamp to split_rfc3164_host_tag
+proc normalize_bsd_timestamp {text batch_context} {
+    # Parsed by position: "Mmm dd [yyyy ]hh:mm:ss[.fff][ text]", with the month capitalized, one or more spaces after it
+    # and a one- or two-digit day. A regexp with a capture group per field costs several times more
+    set month_name [string range $text 0 2]
+    if {![string match {[A-Z][a-z][a-z]} $month_name] || [string index $text 3] ne " "} { return "" }
+    set field_index 4
+    while {[string index $text $field_index] eq " "} { incr field_index }
+    if {![string is digit -strict [string index $text $field_index]]} { return "" }
+    set day_end_index $field_index
+    if {[string is digit -strict [string index $text [expr {$field_index + 1}]]]} { incr day_end_index }
+    if {[string index $text [expr {$day_end_index + 1}]] ne " "} { return "" }
+    set day_text [string range $text $field_index $day_end_index]
+    set field_index [expr {$day_end_index + 2}]
+    set year_text ""
+    if {[string index $text [expr {$field_index + 4}]] eq " " && [string is digit -strict [string range $text $field_index [expr {$field_index + 3}]]]} {
+        set year_text [string range $text $field_index [expr {$field_index + 3}]]
+        incr field_index 5
+    }
+    set hour_text [string range $text $field_index [expr {$field_index + 1}]]
+    set minute_text [string range $text [expr {$field_index + 3}] [expr {$field_index + 4}]]
+    set second_text [string range $text [expr {$field_index + 6}] [expr {$field_index + 7}]]
+    if {[string index $text [expr {$field_index + 2}]] ne ":" || [string index $text [expr {$field_index + 5}]] ne ":"
+        || [string length "$hour_text$minute_text$second_text"] != 6 || ![string is digit -strict "$hour_text$minute_text$second_text"]} { return "" }
+    incr field_index 8
+    set fractional_seconds ""
+    if {[string index $text $field_index] eq "."} {
+        set fraction_end_index $field_index
+        while {[string is digit -strict [string index $text [expr {$fraction_end_index + 1}]]]} { incr fraction_end_index }
+        if {$fraction_end_index > $field_index} {
+            set fractional_seconds [string range $text $field_index $fraction_end_index]
+            set field_index [expr {$fraction_end_index + 1}]
+        }
+    }
+    # The timestamp ends the text or is followed by a space
+    if {$field_index == [string length $text]} {
+        set after_timestamp ""
+    } elseif {[string index $text $field_index] eq " "} {
+        set after_timestamp [string range $text [expr {$field_index + 1}] end]
+    } else {
+        return ""
+    }
+    set month_index [lsearch -exact $static::syslog_normalizer_month_names $month_name]
+    if {$month_index < 0} { return "" }
+    # scan reads decimal; Tcl 8.4 expr and format reject "08" and "09" as invalid octal
+    scan "$day_text $hour_text $minute_text $second_text" "%d %d %d %d" day hour minute second
+    set timestamp_valid [expr {$day >= 1 && $hour <= 23 && $minute <= 59 && $second <= 60}]
+    # RFC 5424 has no leap second; write 60 as 59
+    if {$second == 60} { set second 59 }
+    set month [expr {$month_index + 1}]
+    # RFC 3164 carries no year: a month more than one ahead of now is last year (December received in January), since logs
+    # from months ahead are less plausible than old ones; one month ahead allows for sender clock skew at a month boundary
+    if {$year_text ne ""} {
+        scan $year_text %d year
+    } else {
+        set year [lindex $batch_context 1]
+        if {$month > [lindex $batch_context 2] + 1} { incr year -1 }
+    }
+    if {$day > [call days_in_month $year $month]} { set timestamp_valid 0 }
+    # Fraction truncated to six digits (RFC 5424); the offset is configured because RFC 3164 times are sender-local
+    set timestamp ""
+    if {$timestamp_valid} {
+        set timestamp [format "%04d-%02d-%02dT%02d:%02d:%02d%s%s" $year $month $day $hour $minute $second [string range $fractional_seconds 0 6] $static::syslog_normalizer_default_utc_offset]
+    }
+    return [list $timestamp $after_timestamp]
+}
+# ======================================================================================================
+# Procedure for splitting the RFC 3164 HOSTNAME and TAG that follow a timestamp
+# ======================================================================================================
+# Called by normalize_message for every RFC 3164 body, whether the timestamp ahead of it was BSD (normalize_bsd_timestamp)
+# or ISO (normalize_iso_timestamp)
+# @param after_timestamp - Message text after the timestamp
+# @param source_address - HOSTNAME to use when the message carries none
+# @returns {hostname app_name proc_id message} as received, "-" when absent; the caller sanitizes the header fields
+proc split_rfc3164_host_tag {after_timestamp source_address} {
+    # HOSTNAME is optional (section 4.1.3), so the TAG may come first. The TAG must open with a letter, "_" or "%" so that a time ("12:41:44") is not read as one
+    set hostname $source_address
+    set app_name -
+    set proc_id -
+    set message $after_timestamp
+    # An IPv6 literal HOSTNAME ("fe80::1") would otherwise match the TAG pattern as "fe80:"
+    set tag_fields ""
+    if {![regexp {^[0-9A-Fa-f]*:[0-9A-Fa-f.]*:[0-9A-Fa-f:.]*(?:\s|$)} $after_timestamp]} {
+        set tag_fields [call match_rfc3164_tag $after_timestamp]
+    }
+    # No TAG first: the first token is HOSTNAME, ending the text or followed by a space, and the TAG may follow it
+    if {$tag_fields eq "" && [regexp -indices {^\S+} $after_timestamp hostname_indices]} {
+        set hostname_end_index [lindex $hostname_indices 1]
+        set hostname_found 1
+        if {$hostname_end_index == [string length $after_timestamp] - 1} {
+            set after_hostname ""
+        } elseif {[string index $after_timestamp [expr {$hostname_end_index + 1}]] eq " "} {
+            set after_hostname [string range $after_timestamp [expr {$hostname_end_index + 2}] end]
+        } else {
+            set hostname_found 0
+        }
+        if {$hostname_found} {
+            set hostname [string range $after_timestamp 0 $hostname_end_index]
+            set message $after_hostname
+            set tag_fields [call match_rfc3164_tag $after_hostname]
+        }
+    }
+    if {$tag_fields ne ""} {
+        foreach {app_name proc_id message} $tag_fields { break }
+        if {$proc_id eq ""} { set proc_id - }
+    }
+    return [list $hostname $app_name $proc_id $message]
+}
+# ======================================================================================================
+# Procedure for matching an RFC 3164 TAG at the start of text
+# ======================================================================================================
+# @param text - Text that may open with a TAG, as in "sshd[4121]: message"
+# @returns {app_name proc_id message}, or "" when the text does not open with a TAG. The TAG is a letter, "_" or "%"
+#          and up to 47 more characters other than whitespace, ":" and "[", an optional "[PID]", then ":" and at most one
+#          whitespace character. Matched by position; a regexp with capture groups costs several times more
+proc match_rfc3164_tag {text} {
+    if {![regexp -indices {^[A-Za-z_%][^\s:\[]*} $text name_indices]} { return "" }
+    set name_end_index [lindex $name_indices 1]
+    if {$name_end_index > 47} { return "" }
+    set proc_id ""
+    set tag_index [expr {$name_end_index + 1}]
+    if {[string index $text $tag_index] eq "\["} {
+        if {![regexp -indices -start [expr {$tag_index + 1}] {[\]\s]} $text pid_end_indices]} { return "" }
+        set pid_end_index [lindex $pid_end_indices 0]
+        if {[string index $text $pid_end_index] ne "\]" || $pid_end_index == $tag_index + 1} { return "" }
+        set proc_id [string range $text [expr {$tag_index + 1}] [expr {$pid_end_index - 1}]]
+        set tag_index [expr {$pid_end_index + 1}]
+    }
+    if {[string index $text $tag_index] ne ":"} { return "" }
+    incr tag_index
+    if {[string is space -strict [string index $text $tag_index]]} { incr tag_index }
+    return [list [string range $text 0 $name_end_index] $proc_id [string range $text $tag_index end]]
+}
+# ======================================================================================================
+# Procedure for validating and normalizing an RFC 5424 (ISO 8601 / RFC 3339) TIMESTAMP (section 6.2.3)
+# ======================================================================================================
+# @param timestamp - The TIMESTAMP field as received
+# @returns The normalized timestamp, "-" when the input was "-", or "" when the value is unusable
+#
+# Uppercases "t" and "z", truncates the fraction to 6 digits, rewrites "+hhmm" as "+hh:mm", writes a
+# leap second as 59, and appends the configured offset when none is present. An offset beyond 23:59
+# leaves the instant unknown, so the value is unusable
+proc normalize_iso_timestamp {timestamp} {
+    if {$timestamp eq "-"} { return - }
+    # Fixed positions are checked without a regexp; only a fraction or numeric offset needs one
+    if {[string length $timestamp] < 19} { return "" }
+    set year_text [string range $timestamp 0 3]
+    set month_text [string range $timestamp 5 6]
+    set day_text [string range $timestamp 8 9]
+    set hour_text [string range $timestamp 11 12]
+    set minute_text [string range $timestamp 14 15]
+    set second_text [string range $timestamp 17 18]
+    set separators "[string index $timestamp 4][string index $timestamp 7][string index $timestamp 10][string index $timestamp 13][string index $timestamp 16]"
+    if {![string is digit "$year_text$month_text$day_text$hour_text$minute_text$second_text"] || ($separators ne "--T::" && $separators ne "--t::")} { return "" }
+    set fractional_seconds ""
+    set timestamp_tail [string range $timestamp 19 end]
+    set utc_offset $timestamp_tail
+    if {$timestamp_tail ne "" && $timestamp_tail ne "Z" && ![regexp -nocase {^(\.\d+)?(z|[+-]\d{2}:?\d{2})?$} $timestamp_tail -> fractional_seconds utc_offset]} { return "" }
+    # scan reads decimal (Tcl 8.4 octal)
+    scan "$year_text $month_text $day_text $hour_text $minute_text $second_text" "%d %d %d %d %d %d" year month day hour minute second
+    if {$month < 1 || $month > 12 || $day < 1 || $day > [call days_in_month $year $month] || $hour > 23 || $minute > 59 || $second > 60} { return "" }
+    # RFC 5424 has no leap second; write 60 as 59
+    if {$second == 60} { set second_text 59 }
+    set fractional_seconds [string range $fractional_seconds 0 6]
+    if {[scan [string map {: {}} [string range $utc_offset 1 end]] %2d%2d offset_hour offset_minute] == 2 && ($offset_hour > 23 || $offset_minute > 59)} { return "" }
+    if {$utc_offset eq ""} {
+        set utc_offset $static::syslog_normalizer_default_utc_offset
+    } elseif {[string equal -nocase $utc_offset z]} {
+        set utc_offset Z
+    } elseif {[string length $utc_offset] == 5} {
+        set utc_offset "[string range $utc_offset 0 2]:[string range $utc_offset 3 4]"
+    }
+    return "$year_text-$month_text-${day_text}T$hour_text:$minute_text:$second_text$fractional_seconds$utc_offset"
+}
+# ======================================================================================================
+# Procedure for the day count of a month
+# ======================================================================================================
+# @param year - Four-digit year, used for the leap rule
+# @param month - Month number, 1 to 12
+# @returns 28 to 31
+proc days_in_month {year month} {
+    switch -- $month {
+        4 - 6 - 9 - 11 { return 30 }
+        2 {
+            if {($year % 4 == 0 && $year % 100 != 0) || $year % 400 == 0} { return 29 }
+            return 28
+        }
+        default { return 31 }
+    }
+}
+# ======================================================================================================
+# Procedure for making a header field RFC 5424 compliant
+# ======================================================================================================
+# Called once per header field from the sanitize pass at the end of normalize_message, on every path
+# @param field_value - Field value as received
+# @param max_length - 255 HOSTNAME, 48 APP-NAME, 128 PROCID, 32 MSGID
+# @returns The value reduced to printable US-ASCII (codes 33-126) and cut to length, or "-" if empty
+proc sanitize_header_field {field_value max_length} {
+    # Printable ASCII is both "ascii" and "graph"; anything else goes through regsub, which also covers each byte of a
+    # non-ASCII character
+    if {![string is ascii $field_value] || ![string is graph $field_value]} { regsub -all {[^!-~]} $field_value "_" field_value }
+    if {$field_value eq ""} { return - }
+    return [string range $field_value 0 [expr {$max_length - 1}]]
+}
+# ======================================================================================================
+# Procedure for separating and validating STRUCTURED-DATA (RFC 5424 section 6.3)
+# ======================================================================================================
+# @param after_msg_id - Everything after MSGID: structured data, then an optional message body
+# @returns {structured_data message valid}. Invalid data returns "-" with the original text kept at
+#          the head of the message, so nothing received is lost
+proc split_structured_data {after_msg_id} {
+    if {$after_msg_id eq "-"} { return [list - "" 1] }
+    if {[string range $after_msg_id 0 1] eq "- "} { return [list - [string range $after_msg_id 2 end] 1] }
+    # One SD-ELEMENT per match, capture-free: a lookahead or capture groups over the whole run cost several times more
+    #   timeQuality|origin|meta|NAME@ENTERPRISE
+    #                        SD-ID - an IANA name or NAME@ENTERPRISE (7.2); any other name without "@" is invalid
+    #   [!#-<>-\\^-~]{1,32}  PARAM-NAME - no '"', '=', ']' or space
+    #   (?:\\.|[^]"\\])*     PARAM-VALUE - '"', '\' and ']' escaped (6.3.3)
+    set element_start_index 0
+    while {[string index $after_msg_id $element_start_index] eq "\["} {
+        set element_text [string range $after_msg_id $element_start_index end]
+        if {![regexp -indices {^\[(?:timeQuality|origin|meta|[!#-<>-?A-\\^-~]+@[0-9]+(?:\.[0-9]+)*)(?: [!#-<>-\\^-~]{1,32}="(?:\\.|[^]"\\])*")*\]} $element_text element_indices]} { return [list - $after_msg_id 0] }
+        # SD-ID at most 32 characters: it ends at the first space or "]" in the element
+        set sd_id_end_index [string first "\]" $element_text]
+        set space_index [string first " " $element_text]
+        if {$space_index >= 0 && $space_index < $sd_id_end_index} { set sd_id_end_index $space_index }
+        if {$sd_id_end_index - 1 > 32} { return [list - $after_msg_id 0] }
+        incr element_start_index [expr {[lindex $element_indices 1] + 1}]
+    }
+    # At least one element, followed by the end or a space and the message body
+    if {$element_start_index == 0} { return [list - $after_msg_id 0] }
+    if {$element_start_index == [string length $after_msg_id]} { return [list $after_msg_id "" 1] }
+    if {[string index $after_msg_id $element_start_index] ne " "} { return [list - $after_msg_id 0] }
+    return [list [string range $after_msg_id 0 [expr {$element_start_index - 1}]] [string range $after_msg_id [expr {$element_start_index + 1}] end] 1]
+}
+# ======================================================================================================
+# Procedure for assembling an RFC 5424 message
+# ======================================================================================================
+# @param priority - PRI value, 0 to 191
+# @param timestamp - RFC 5424 TIMESTAMP, or "-"
+# @param hostname, app_name, proc_id, msg_id - Header fields, each "-" when unknown
+# @param structured_data - One or more SD elements, or "-"
+# @param message - Message body, empty when there is none
+# @returns The assembled message, with a single space before the body when one is present. The single exit of
+#          normalize_message, so output well-formedness is testable in one place
+proc build_rfc5424_message {priority timestamp hostname app_name proc_id msg_id structured_data message} {
+    set assembled_message "<$priority>1 $timestamp $hostname $app_name $proc_id $msg_id $structured_data"
+    if {$message ne ""} { append assembled_message " $message" }
+    return $assembled_message
+}
