@@ -8,26 +8,26 @@ Large enterprises should use a dedicated solution for syslog normalization, such
 
 ## What it checks and fixes
 
-- No priority value, or one out of range. Wrapped in a valid header built from the arrival time and the sender's address, with the original text kept as the message.
-- A priority written with a leading zero. Rewritten without it.
-- An old BSD-format message. Converted to RFC 5424, keeping the hostname, program name and process ID the sender supplied.
-- A version field placed in front of an unconverted BSD header, which is what Aria sends. Converted the same way.
+- The presence of no priority value, or a value out of range (0-191). Ensures the value is wrapped in a valid RFC5424 header.
+- A priority written with a leading zero which is rewritten without it.
+- An old BSD-format message which is converted to RFC 5424 while keeping the hostname, the program name and the process ID of the original message.
+- A version field placed in front of an unconverted BSD header, which is what Log Insight Aria sends. 
 - A BSD program name and text following an otherwise modern header, the other Aria case. The program name and process ID are split out and the rest becomes the message.
-- The rsyslog forwarding format, a BSD layout with an ISO timestamp. Converted to RFC 5424.
-- A timestamp with a space in place of the `T`, a lowercase `t` or `z`, a fraction longer than six digits, or an offset written without its colon. Rewritten in canonical form.
-- A timestamp with no offset at all. Given the offset you configure.
-- A date that cannot exist, such as February 30th or month 13. Replaced with the arrival time, keeping the sender's hostname and program name.
-- Timestamp and hostname in each other's places. Swapped back.
-- Structured data sitting in a header field because earlier fields were omitted. Moved back where it belongs.
-- A program name still in its BSD form, `sshd[4121]:`. Split into the separate program name and process ID fields Sentinel expects.
-- A header too short to trust. Wrapped like a message with no header at all.
-- Hostname, program name, process ID or message ID outside printable ASCII or over the length RFC 5424 allows. Bad bytes become underscores, over-long values are truncated.
-- Malformed structured data. Replaced with the null value, its original text kept at the front of the message.
-- No structured data field at all. The null value is inserted.
+- The rsyslog forwarding format, a BSD layout with an ISO timestamp. This is converted to RFC 5424 formatting.
+- A timestamp with a space in place of the `T`, a lowercase `t` or `z`, a fraction longer than six digits, or an offset written without its colon. This is rewritten in canonical form.
+- A timestamp with no offset at all. 
+- A date that cannot exist, such as February 30th or month 13. This is replaced with the arrival time, keeping the sender's hostname and program name.
+- Timestamp and hostname swapped. These are swapped back.
+- Structured data sitting in a header field because earlier fields were omitted. The Structured Data is moved back where it belongs for RFC5424.
+- A program name still in its BSD form i.e. `sshd[4121]:`.  This is split into the separate program name and process ID fields.
+- A header too short to trust. This is wrapped like a message with no header at all.
+- A Hostname, program name, process ID or message ID outside printable ASCII or over the length RFC 5424 allows. These bad bytes become underscores and over-long values are simply truncated.
+- Malformed structured data. This is replaced with the null value, its original text is kept at the front of the message.
+- No structured data field at all; The null value is inserted.
 - Messages framed by length count or by line feed, including a sender that mixes the two mid-stream. Detected per connection and resynchronized without losing messages.
-- Frames larger than the configured limit. Passed through unparsed.
+- Frames larger than the configured limit. These are passed through unparsed.
 
-Compliant messages are forwarded byte for byte. Nothing is dropped; the only bytes lost are the truncations above, and every change is logged if logging is enabled.
+Compliant messages are forwarded byte for byte. The only bytes lost are the truncations above, and every change is logged if logging is enabled.
 
 ## Settings
 
