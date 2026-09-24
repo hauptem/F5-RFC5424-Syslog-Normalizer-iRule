@@ -1,8 +1,8 @@
 # RFC5424-Syslog-Normalizer_v1.0_irule
 # 
 # Version 1.0
-# September 2026
 # Eric Haupt
+# https://github.com/hauptem/F5-RFC5424-Syslog-Normalizer-iRule
 #
 # Description:
 #   Normalizes non-compliant TCP syslog messages to RFC5424 via a 3 layer procedural call stack for export to a RFC5424 receiver.
