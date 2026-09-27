@@ -43,16 +43,6 @@ In `RULE_INIT` at the top of the rule.
 | `syslog_normalizer_split_rfc3164_tag` | `1` | Split a 3164 tag into APP-NAME and PROCID |
 | `syslog_normalizer_max_message_bytes` | `65536` | Largest message parsed; per-connection memory ceiling |
 
-
-## Logging
-
-Two line types, neither carrying message content:
-
-```
-syslog_noncompliant source=10.1.2.3 host=web01 ts=2026-09-19T17:55:40Z reason="legacy BSD RFC 3164 message"
-syslog_framing_error source=10.1.2.3 octet-count desync at "...", scanning for next frame
-```
-
 ## License
 
 MIT License - see [LICENSE](LICENSE) file for details.
