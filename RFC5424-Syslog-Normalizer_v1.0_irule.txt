@@ -1,7 +1,7 @@
 # RFC5424-Syslog-Normalizer_v1.0_irule
 # 
 # Version 1.0
-# Eric Haupt
+# Author: Eric Haupt
 # https://github.com/hauptem/F5-RFC5424-Syslog-Normalizer-iRule
 #
 # Description:
