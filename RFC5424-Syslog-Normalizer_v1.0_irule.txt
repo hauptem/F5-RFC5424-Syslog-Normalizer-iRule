@@ -2,6 +2,7 @@
 # 
 # Version 1.0
 # Author: Eric Haupt
+# Released under the MIT License. See LICENSE file for details.
 # https://github.com/hauptem/F5-RFC5424-Syslog-Normalizer-iRule
 #
 # Description:
