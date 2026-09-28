@@ -2,9 +2,9 @@
 
 An F5 BIG-IP iRule that checks every syslog message on a TCP stream against RFC 5424 and either reports what is wrong or rewrites it into a valid message before it reaches the collector.
 
-**Note that while every effort was taken to process TCP syslog as fast as possible, this solution is CPU intense and only recommended for small environments with limited messages per second requirements.**
+**Note that while every effort was taken to maximize TCP syslog processing efficiently, this solution is CPU intense and is only recommended for smaller environments that have lower syslog messages per second requirements.**
 
-Large enterprises should use a dedicated solution for syslog normalization, such as **Cribl.**
+Large enterprises should use a dedicated solution for syslog normalization, such as **Cribl Stream.**
 
 ## What it checks and fixes
 
