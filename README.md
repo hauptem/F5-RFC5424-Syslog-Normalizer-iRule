@@ -1,5 +1,9 @@
 # F5-RFC5424-Syslog-Normalizer-iRule
 
+![License](https://img.shields.io/badge/license-MIT-green)
+![TMOS Version](https://img.shields.io/badge/TMOS-17.x%20%7C%2021.x-red)
+![F5 iRules](https://img.shields.io/badge/F5-iRules%20(Tcl)-FF6600?logo=f5&logoColor=white)
+
 An F5 BIG-IP iRule that checks every syslog message on a TCP stream against RFC 5424 and either reports what is wrong or rewrites it into a valid message before it reaches the collector.
 
 **Note that while every effort was taken to maximize TCP syslog processing efficiently, this solution is CPU intense and is only recommended for smaller environments that have lower syslog messages per second requirements.**
