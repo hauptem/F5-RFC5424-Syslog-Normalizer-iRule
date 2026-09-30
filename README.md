@@ -8,7 +8,7 @@ An F5 BIG-IP iRule that checks every syslog message on a TCP stream against RFC 
 
 **Note that while every effort was taken to maximize TCP syslog processing efficiently, this solution is CPU intense and is only recommended for smaller environments that have lower syslog messages per second requirements.**
 
-Largeer organizations should use a dedicated solution for syslog normalization, such as **Cribl Stream.**
+Larger organizations should use a dedicated solution for syslog normalization, such as **Cribl Stream.**
 
 ## What it checks and fixes
 
