@@ -25,13 +25,13 @@ Larger organizations should use a dedicated solution for syslog normalization, s
 - Structured data sitting in a header field because earlier fields were omitted. The Structured Data is moved back where it belongs for RFC5424.
 - A program name still in its BSD form i.e. `sshd[4121]:`.  This is split into the separate program name and process ID fields.
 - A header too short to trust. This is wrapped like a message with no header at all.
-- A Hostname, program name, process ID or message ID outside printable ASCII or over the length RFC 5424 allows. These bad bytes become underscores and over-long values are simply truncated.
+- A Hostname, program name, process ID or message ID outside printable ASCII or over the length RFC 5424 allows. These bad bytes become underscores and over-long values are simply truncated. The exception is a byte Tcl classes as whitespace, such as 0xA0 (the second byte of UTF-8 `à`), which splits the field and makes the header too short to trust.
 - Malformed structured data. This is replaced with the null value, its original text is kept at the front of the message.
 - No structured data field at all; The null value is inserted.
-- Messages framed by length count or by line feed, including a sender that mixes the two mid-stream. Detected per connection and resynchronized without losing messages.
+- Messages framed by length count or by line feed. Framing is detected once per connection. If an octet-counted sender loses sync or switches to line feeds, the rule scans for the next `<length> <PRI>` frame and forwards everything skipped as a single message, so no bytes are lost but the skipped lines are merged and not repaired individually.
 - Frames larger than the configured limit. These are passed through unparsed.
 
-Compliant messages are forwarded byte for byte. The only bytes lost are the truncations above, and every change is logged if logging is enabled.
+Compliant messages are forwarded byte for byte, apart from framing conversion in repair mode: a trailing CR is dropped when line feed input is written as octet frames, and embedded line feeds become spaces when output framing is `lf`. Bytes are lost in two places: the truncations above, and in repair mode a final line-feed-framed message still unterminated when the client closes, which an iRule cannot forward after `CLIENT_CLOSED`. Both are logged when logging is enabled; non-compliant messages are logged by sample, per the settings below.
 
 ## Settings
 
@@ -40,8 +40,8 @@ In `RULE_INIT` at the top of the rule.
 | Variable | Default | Effect |
 | --- | --- | --- |
 | `syslog_normalizer_repair` | `0` | `0` reports, `1` rewrites non-compliant messages |
-| `syslog_normalizer_logging` | `1` | All logging to local0, on or off |
-| `syslog_normalizer_log_sample_every` | `100` | First occurrence of each reason combination per connection, then every Nth |
+| `syslog_normalizer_logging` | `0` | All logging to local0, on or off |
+| `syslog_normalizer_log_sample_every` | `10000` | First occurrence of each reason combination per connection, then every Nth |
 | `syslog_normalizer_output_framing` | `"octet"` | Repair output framing, `octet` or `lf`; must match the collector |
 | `syslog_normalizer_default_utc_offset` | `"Z"` | Offset for timestamps carrying none, including every RFC 3164 timestamp |
 | `syslog_normalizer_split_rfc3164_tag` | `1` | Split a 3164 tag into APP-NAME and PROCID |
